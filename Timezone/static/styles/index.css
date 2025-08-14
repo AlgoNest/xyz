@@ -1,9 +1,16 @@
 body {
     background-color: rgb(0 59 149 / 4%);
 }
-nav #product-name {
+#product-name {
     color:  rgb(47, 47, 141);
     font-weight: bold;
+    font-size: 25px;
+    vertical-align: middle;
+    display: inline-block
+}
+.nav-link {
+    vertical-align: middle;
+    display: inline-block;
 }
 .main_header_of_index_page {
     width: 550px;
