@@ -1,0 +1,44 @@
+body {
+    background-color: rgb(0 59 149 / 4%);
+}
+nav #product-name {
+    color:  rgb(47, 47, 141);
+    font-weight: bold;
+}
+.main_header_of_index_page {
+    width: 550px;
+    font-family: Verdana, Geneva, Tahoma, sans-serif;
+    margin: 50px 80px;
+    display: inline-block;
+    vertical-align: middle;
+
+}
+.main_header_of_index_page h1 {
+    font-size: 3.5rem;
+    line-height: 1;
+}
+.main_header_of_index_page p {
+    font-size: 1.5rem;
+    line-height: 2rem;
+}
+.main_header_of_index_page a img {
+    width: 150px;
+}
+.main_header_of_index_page button {
+    padding: 10px 22px;
+    background-color: rgb(47, 47, 141);
+    border: none;
+    outline: none;
+    border-radius: 10px;
+    font-size: bold;
+    color: whitesmoke;
+}
+.round_earth_image {
+    display: inline-block;
+    vertical-align: middle;
+    margin-left: 250px;
+}
+.round_earth_image img {
+    width: 500px;
+    display: inline-block;
+}
