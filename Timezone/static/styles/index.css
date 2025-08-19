@@ -6,11 +6,13 @@ body {
     font-weight: bold;
     font-size: 25px;
     vertical-align: middle;
-    display: inline-block
+    display: inline-block;
+    margin-left: 20px;
 }
 .nav-link {
     vertical-align: middle;
     display: inline-block;
+    text-align: center
 }
 .main_header_of_index_page {
     width: 550px;
@@ -46,6 +48,25 @@ body {
     margin-left: 250px;
 }
 .round_earth_image img {
-    width: 500px;
+    width: 550px;
     display: inline-block;
+}
+.example_that_user_chatting {
+    margin: 30px;
+    border-radius: 10px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+}
+.example_that_user_chatting div {
+    display: block;
+    align-items: center;
+    padding: 10px;
+}
+/* this means their is a class inside class i'm targeting 
+like you are referenceing third class inside another classess */
+.example_that_user_chatting .example_chatt .user_image img {
+    width: 40px;
+}
+.example_that_user_chatting .example_chatt .user_image span {
+    font-size: 14px;
+    color: rgb(0, 0, 0, 0.5);
 }
