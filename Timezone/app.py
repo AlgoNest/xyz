@@ -1,8 +1,10 @@
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 import pytz
@@ -12,6 +14,66 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+# Database Configuration
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'teamzone.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize database
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+# Models
+class Workspace(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    slack_team_id = db.Column(db.String(20), unique=True, nullable=False)
+    slack_access_token = db.Column(db.String(100), nullable=False)
+    name = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    users = db.relationship('User', backref='workspace', lazy=True)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    slack_user_id = db.Column(db.String(20), unique=True, nullable=False)
+    workspace_id = db.Column(db.Integer, db.ForeignKey('workspace.id'), nullable=False)
+    name = db.Column(db.String(100))
+    email = db.Column(db.String(120))
+    timezone = db.Column(db.String(50))
+    avatar_url = db.Column(db.String(200))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_active = db.Column(db.DateTime)
+
+class TeamGroup(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey('workspace.id'), nullable=False)
+    name = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    users = db.relationship('User', secondary='team_group_members')
+
+class TeamGroupMember(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    team_group_id = db.Column(db.Integer, db.ForeignKey('team_group.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Meeting(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey('workspace.id'), nullable=False)
+    organizer_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    start_time = db.Column(db.DateTime, nullable=False)
+    duration = db.Column(db.Integer, nullable=False)  # Duration in minutes
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class MeetingParticipant(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey('meeting.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    status = db.Column(db.String(20), default='pending')  # pending, accepted, declined
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    meeting = db.relationship('Meeting', backref=db.backref('participants', lazy=True))
 
 # Initialize Slack client
 slack_token = os.getenv('SLACK_BOT_TOKEN')
@@ -36,27 +98,74 @@ def slack_oauth_callback():
     client_secret = os.getenv('SLACK_CLIENT_SECRET')
     
     try:
+        # Get OAuth response
         response = slack_client.oauth_v2_access(
             client_id=client_id,
             client_secret=client_secret,
             code=code
         )
-        # Here you would typically store the access token securely
-        # For demo purposes, we'll just return success
-        return jsonify({"status": "success"})
+        
+        # Get team info
+        team_client = WebClient(token=response['access_token'])
+        team_info = team_client.team_info()['team']
+        
+        # Store or update workspace
+        workspace = Workspace.query.filter_by(slack_team_id=team_info['id']).first()
+        if not workspace:
+            workspace = Workspace(
+                slack_team_id=team_info['id'],
+                slack_access_token=response['access_token'],
+                name=team_info['name']
+            )
+            db.session.add(workspace)
+        else:
+            workspace.slack_access_token = response['access_token']
+            workspace.name = team_info['name']
+        
+        # Commit changes
+        db.session.commit()
+        
+        return jsonify({"status": "success", "team": team_info['name']})
     except SlackApiError as e:
         return jsonify({"error": str(e)}), 400
 
 @app.route("/api/slack/users", methods=['GET'])
 def get_slack_users():
     try:
-        result = slack_client.users_list()
+        workspace_id = request.args.get('workspace_id')
+        workspace = Workspace.query.filter_by(id=workspace_id).first()
+        if not workspace:
+            return jsonify({"error": "Workspace not found"}), 404
+
+        team_client = WebClient(token=workspace.slack_access_token)
+        result = team_client.users_list()
         users = []
+        
         for member in result["members"]:
             if not member.get("is_bot") and not member.get("deleted"):
                 tz = member.get("tz")
                 if tz:
                     current_time = datetime.now(pytz.timezone(tz))
+                    
+                    # Update or create user in database
+                    user = User.query.filter_by(slack_user_id=member["id"]).first()
+                    if not user:
+                        user = User(
+                            slack_user_id=member["id"],
+                            workspace_id=workspace.id,
+                            name=member.get("real_name", member["name"]),
+                            email=member.get("profile", {}).get("email"),
+                            timezone=tz,
+                            avatar_url=member.get("profile", {}).get("image_72")
+                        )
+                        db.session.add(user)
+                    else:
+                        user.name = member.get("real_name", member["name"])
+                        user.email = member.get("profile", {}).get("email")
+                        user.timezone = tz
+                        user.avatar_url = member.get("profile", {}).get("image_72")
+                        user.last_active = datetime.utcnow()
+                    
                     users.append({
                         "id": member["id"],
                         "name": member.get("real_name", member["name"]),
@@ -65,6 +174,9 @@ def get_slack_users():
                         "local_time": current_time.strftime("%I:%M %p"),
                         "avatar": member.get("profile", {}).get("image_72")
                     })
+        
+        # Commit all changes
+        db.session.commit()
         return jsonify(users)
     except SlackApiError as e:
         return jsonify({"error": str(e)}), 400
@@ -82,5 +194,161 @@ def send_slack_message():
     except SlackApiError as e:
         return jsonify({"error": str(e)}), 400
 
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.route("/api/meetings", methods=['POST'])
+def create_meeting():
+    try:
+        data = request.json
+        workspace_id = data.get('workspace_id')
+        organizer_id = data.get('organizer_id')
+        
+        # Create new meeting
+        meeting = Meeting(
+            workspace_id=workspace_id,
+            organizer_id=organizer_id,
+            title=data.get('title'),
+            description=data.get('description'),
+            start_time=datetime.fromisoformat(data.get('start_time')),
+            duration=data.get('duration', 30)
+        )
+        db.session.add(meeting)
+        
+        # Add participants
+        for participant_id in data.get('participants', []):
+            participant = MeetingParticipant(
+                meeting_id=meeting.id,
+                user_id=participant_id
+            )
+            db.session.add(participant)
+        
+        db.session.commit()
+        
+        # Send Slack notifications
+        workspace = Workspace.query.get(workspace_id)
+        client = WebClient(token=workspace.slack_access_token)
+        
+        for participant_id in data.get('participants', []):
+            user = User.query.get(participant_id)
+            local_time = meeting.start_time.astimezone(pytz.timezone(user.timezone))
+            
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*New meeting invitation: {meeting.title}*\n"
+                               f"When: {local_time.strftime('%B %d, %Y at %I:%M %p')} (your local time)\n"
+                               f"Duration: {meeting.duration} minutes\n"
+                               f"Description: {meeting.description}"
+                    }
+                }
+            ]
+            
+            try:
+                client.chat_postMessage(
+                    channel=user.slack_user_id,
+                    text=f"New meeting invitation: {meeting.title}",
+                    blocks=blocks
+                )
+            except SlackApiError:
+                pass  # Handle notification failure gracefully
+        
+        return jsonify({"status": "success", "meeting_id": meeting.id})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/meetings/<int:workspace_id>", methods=['GET'])
+def get_meetings(workspace_id):
+    try:
+        meetings = Meeting.query.filter_by(workspace_id=workspace_id).all()
+        result = []
+        
+        for meeting in meetings:
+            participants = MeetingParticipant.query.filter_by(meeting_id=meeting.id).all()
+            participant_details = []
+            
+            for participant in participants:
+                user = User.query.get(participant.user_id)
+                local_time = meeting.start_time.astimezone(pytz.timezone(user.timezone))
+                participant_details.append({
+                    "user_id": user.id,
+                    "name": user.name,
+                    "timezone": user.timezone,
+                    "local_time": local_time.strftime("%I:%M %p"),
+                    "status": participant.status
+                })
+            
+            result.append({
+                "id": meeting.id,
+                "title": meeting.title,
+                "description": meeting.description,
+                "start_time": meeting.start_time.isoformat(),
+                "duration": meeting.duration,
+                "participants": participant_details
+            })
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/meetings/suggest-times", methods=['POST'])
+def suggest_meeting_times():
+    try:
+        data = request.json
+        participant_ids = data.get('participant_ids', [])
+        duration = data.get('duration', 30)
+        
+        # Get all participants' timezones
+        participants = User.query.filter(User.id.in_(participant_ids)).all()
+        if not participants:
+            return jsonify({"error": "No valid participants found"}), 400
+        
+        # Get current time in each timezone and find suitable slots
+        now = datetime.utcnow()
+        work_hours = range(9, 17)  # 9 AM to 5 PM
+        suggestions = []
+        
+        # Look for slots in the next 5 business days
+        for day_offset in range(5):
+            check_date = now + timedelta(days=day_offset)
+            if check_date.weekday() >= 5:  # Skip weekends
+                continue
+                
+            # Check each hour during work hours
+            for hour in work_hours:
+                check_time = check_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+                suitable = True
+                local_times = []
+                
+                # Check if this time works for all participants
+                for participant in participants:
+                    tz = pytz.timezone(participant.timezone)
+                    local_time = check_time.astimezone(tz)
+                    local_hour = local_time.hour
+                    
+                    # Check if it's during work hours in participant's timezone
+                    if local_hour < 9 or local_hour > 17:
+                        suitable = False
+                        break
+                        
+                    local_times.append({
+                        "user_id": participant.id,
+                        "name": participant.name,
+                        "local_time": local_time.strftime("%I:%M %p %Z")
+                    })
+                
+                if suitable:
+                    suggestions.append({
+                        "utc_time": check_time.isoformat(),
+                        "participant_times": local_times
+                    })
+                    
+                if len(suggestions) >= 5:  # Limit to 5 suggestions
+                    break
+            
+            if len(suggestions) >= 5:
+                break
+        
+        return jsonify(suggestions)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
