@@ -1,13 +1,38 @@
+# Core Flask imports
 from flask import Flask, render_template, request, jsonify
-from flask_cors import CORS
+
+# Security related imports
+from flask_security import Security, SQLAlchemyUserDatastore, \
+    UserMixin, RoleMixin, login_required
+from flask_security.utils import hash_password, verify_password
+from flask_session import Session  # Server-side session management
+from flask_wtf.csrf import CSRFProtect  # CSRF protection
+from flask_talisman import Talisman  # Security headers
+from flask_limiter import Limiter  # Rate limiting
+from flask_limiter.util import get_remote_address
+
+# Database and migration
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
+
+# API related
+from flask_cors import CORS  # Cross-Origin Resource Sharing
+
+# Other utilities
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 import pytz
+from werkzeug.exceptions import HTTPException 
+
+
+
+
+
 
 # Load environment variables
 load_dotenv()
@@ -20,9 +45,101 @@ basedir = os.path.abspath(os.path.dirname(__file__))
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'teamzone.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+# Security Configuration
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', os.urandom(24))
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+# Initialize security extensions
+Talisman(app, 
+    content_security_policy={
+        'default-src': "'self'",
+        'img-src': "'self' data: https:",
+        'script-src': "'self' 'unsafe-inline' 'unsafe-eval'",
+        'style-src': "'self' 'unsafe-inline' https:",
+    },
+    force_https=True
+)
+
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+
 # Initialize database
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
+
+# Configure logging
+if not app.debug:
+    if not os.path.exists('logs'):
+        os.mkdir('logs')
+    file_handler = RotatingFileHandler('logs/teamzone.log', maxBytes=10240, backupCount=10)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+    ))
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('TeamZone startup')
+
+# Error handlers
+@app.errorhandler(HTTPException)
+def handle_http_error(error):
+    response = {
+        "error": {
+            "code": error.code,
+            "name": error.name,
+            "description": error.description,
+        }
+    }
+    return jsonify(response), error.code
+
+@app.errorhandler(Exception)
+def handle_exception(error):
+    app.logger.error(f'Unhandled exception: {str(error)}')
+    response = {
+        "error": {
+            "code": 500,
+            "name": "Internal Server Error",
+            "description": "An unexpected error occurred"
+        }
+    }
+    return jsonify(response), 500
+
+# Authentication decorator
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        workspace_id = request.args.get('workspace_id')
+        if not workspace_id:
+            return jsonify({"error": "Workspace ID is required"}), 401
+        
+        workspace = Workspace.query.get(workspace_id)
+        if not workspace:
+            return jsonify({"error": "Invalid workspace"}), 401
+        
+        return f(*args, **kwargs)
+    return decorated
+
+# Input validation
+def validate_meeting_input(data):
+    required_fields = ['title', 'start_time', 'duration']
+    for field in required_fields:
+        if field not in data:
+            raise ValueError(f"Missing required field: {field}")
+    
+    try:
+        datetime.fromisoformat(data['start_time'])
+    except ValueError:
+        raise ValueError("Invalid start_time format. Use ISO format")
+    
+    if not isinstance(data['duration'], (int, float)) or data['duration'] <= 0:
+        raise ValueError("Duration must be a positive number")
 
 # Models
 class Workspace(db.Model):
@@ -92,10 +209,23 @@ def slack_install():
     })
 
 @app.route("/api/slack/oauth/callback", methods=['GET'])
+@limiter.limit("10/minute")
 def slack_oauth_callback():
+    error = request.args.get('error')
+    if error:
+        app.logger.error(f"Slack OAuth error: {error}")
+        return jsonify({"error": "Slack OAuth failed", "details": error}), 400
+
     code = request.args.get('code')
+    if not code:
+        return jsonify({"error": "No authorization code provided"}), 400
+
     client_id = os.getenv('SLACK_CLIENT_ID')
     client_secret = os.getenv('SLACK_CLIENT_SECRET')
+    
+    if not client_id or not client_secret:
+        app.logger.error("Missing Slack credentials")
+        return jsonify({"error": "Server configuration error"}), 500
     
     try:
         # Get OAuth response
@@ -130,10 +260,14 @@ def slack_oauth_callback():
         return jsonify({"error": str(e)}), 400
 
 @app.route("/api/slack/users", methods=['GET'])
+@limiter.limit("30/minute")
+@require_auth
 def get_slack_users():
     try:
         workspace_id = request.args.get('workspace_id')
         workspace = Workspace.query.filter_by(id=workspace_id).first()
+        
+        # This check is redundant due to @require_auth but kept for clarity
         if not workspace:
             return jsonify({"error": "Workspace not found"}), 404
 
@@ -195,11 +329,26 @@ def send_slack_message():
         return jsonify({"error": str(e)}), 400
 
 @app.route("/api/meetings", methods=['POST'])
+@limiter.limit("10/minute")
+@require_auth
 def create_meeting():
     try:
         data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        try:
+            validate_meeting_input(data)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
         workspace_id = data.get('workspace_id')
         organizer_id = data.get('organizer_id')
+        
+        # Validate organizer exists
+        organizer = User.query.get(organizer_id)
+        if not organizer:
+            return jsonify({"error": "Invalid organizer"}), 400
         
         # Create new meeting
         meeting = Meeting(
