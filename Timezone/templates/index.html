@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -20,6 +19,68 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
   <link rel="stylesheet" href="static/styles/assets/css/main.css">
+  <style>
+    body {
+      padding-top: 76px; /* Height of navbar + padding */
+    }
+    .navbar {
+      height: 70px;
+      backdrop-filter: blur(10px);
+      background-color: rgba(255, 255, 255, 0.95) !important;
+    }
+    section {
+      padding: 80px 0;
+    }
+    #hero {
+      min-height: calc(100vh - 76px);
+      display: flex;
+      align-items: center;
+      background-color: #f8f9fa;
+      overflow: hidden;
+    }
+    .hero-content {
+      max-width: 600px;
+      margin: 0 auto;
+    }
+    .hero-image {
+      max-width: 550px;
+      margin: 0 auto;
+    }
+    .btn-slack {
+      transition: transform 0.2s ease;
+    }
+    .btn-slack:hover {
+      transform: translateY(-2px);
+    }
+    @media (max-width: 991px) {
+      #hero .display-4 {
+        font-size: 2.5rem;
+      }
+      .hero-content {
+        padding: 2rem 1rem;
+      }
+    }
+    .card {
+      transition: transform 0.2s ease-in-out;
+    }
+    .card:hover {
+      transform: translateY(-5px);
+    }
+    @media (max-width: 768px) {
+      body {
+        padding-top: 62px;
+      }
+      .navbar {
+        height: 56px;
+      }
+      section {
+        padding: 40px 0;
+      }
+      #hero {
+        min-height: calc(100vh - 62px);
+      }
+    }
+  </style>
 </head>
 <body>
   <!-- Navbar -->
@@ -31,13 +92,12 @@
       </button>
       <div class="collapse navbar-collapse" id="navbarNav">
         <ul class="navbar-nav ms-auto mb-2 mb-lg-0">
-          <li class="nav-item"><a class="nav-link active" href="#about">About</a></li>
           <li class="nav-item"><a class="nav-link" href="#features">Features</a></li>
+          <li class="nav-item"><a class="nav-link active" href="#pricing">Pricing</a></li>
+          <li class="nav-item"><a class="nav-link active" href="#contact">Contact</a></li>
           {% if user %}
             <li class="nav-item"><a class="nav-link" href="{{ url_for('dashboard') }}">Dashboard</a></li>
             <li class="nav-item"><a class="nav-link" href="{{ url_for('logout') }}">Logout</a></li>
-          {% else %}
-            <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
           {% endif %}
         </ul>
       </div>
@@ -45,23 +105,30 @@
   </nav>
 
   <!-- Hero Section -->
-  <section id="hero" class="py-5 bg-light text-center d-flex align-items-center" style="min-height: 100vh;">
+  <section id="hero" class="bg-light">
     <div class="container">
-      <div class="row justify-content-center align-items-center">
-        <div class="col-lg-7">
-          <h1 class="display-4 fw-bold mb-3">Effortless Timezone Management for Remote Teams</h1>
-          <p class="lead mb-4">TeamZone makes global collaboration simple. Instantly convert time zones, find the perfect meeting window, and keep your team in sync—wherever they are.</p>
-          <div class="d-grid gap-2 d-md-flex justify-content-md-center">
-            {% if user %}
-              <a href="{{ url_for('dashboard') }}" class="btn btn-primary btn-lg px-4">Go to Dashboard</a>
-            {% else %}
-              <a href="#features" class="btn btn-primary btn-lg me-2">Explore Features</a>
-              <a href="#" class="btn btn-outline-secondary btn-lg">Add to Slack</a>
-            {% endif %}
+      <div class="row align-items-center">
+        <div class="col-md-6">
+          <div class="hero-content">
+            <h1 class="display-4 fw-bold mb-3">Effortless Timezone Management for Remote Teams</h1>
+            <p class="lead mb-4">TeamZone makes global collaboration simple. Instantly convert time zones, find the perfect meeting window, and keep your team in sync—wherever they are.</p>
+            <div class="d-flex gap-2 justify-content-center justify-content-md-start">
+              {% if user %}
+                <a href="{{ url_for('dashboard') }}" class="btn btn-primary btn-lg px-4">Go to Dashboard</a>
+              {% else %}
+                <a href="#features" class="btn btn-primary btn-lg py-2 px-4">Explore Features</a>
+                <a href="{{ url_for('slack_login') }}" class="d-inline-block align-middle ms-2">
+                  <img alt="Add to Slack" class="btn-slack" style="height:42px;" 
+                       src="https://platform.slack-edge.com/img/add_to_slack.png" 
+                       srcset="https://platform.slack-edge.com/img/add_to_slack.png 1x, https://platform.slack-edge.com/img/add_to_slack@2x.png 2x" />
+                </a>
+              {% endif %}
+            </div>
           </div>
         </div>
-        <div class="col-lg-5 d-none d-lg-block">
-          <img src="static/styles/assets/img/illustration/illustration-15.webp" alt="TeamZone Hero" class="img-fluid">
+
+        <div class="col-md-6 text-center">
+          <img src="static/styles/assets/img/illustration/illustration-15.webp" alt="TeamZone Hero" class="img-fluid" style="max-height:480px; width:100%; object-fit:contain;">
         </div>
       </div>
     </div>

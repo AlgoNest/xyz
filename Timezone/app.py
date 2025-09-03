@@ -6,6 +6,18 @@ import os
 import pytz
 from functools import wraps
 import secrets
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Slack Configuration
+SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID')
+SLACK_CLIENT_SECRET = os.getenv('SLACK_CLIENT_SECRET')
+SLACK_REDIRECT_URI = os.getenv('SLACK_REDIRECT_URI', 'http://localhost:5000/slack/callback')
+SLACK_SCOPES = 'users:read,users:read.email,identity.basic,identity.email,identity.avatar'
 
 # Create Flask app
 app = Flask(__name__)
@@ -20,9 +32,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
             name TEXT NOT NULL,
-            timezone TEXT
+            timezone TEXT,
+            slack_id TEXT UNIQUE NOT NULL,
+            avatar TEXT,
+            workspace_id TEXT NOT NULL
         )
     ''')
     
@@ -74,67 +88,6 @@ def login_required(f):
 def index():
     return render_template('index.html', user=session.get('user_name'))
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
-        
-    if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        
-        if not email or not password:
-            flash('Please fill in all fields')
-            return redirect(url_for('login'))
-        
-        user = query_db('SELECT * FROM users WHERE email = ?', [email], one=True)
-        
-        if user and check_password_hash(user['password_hash'], password):
-            session.permanent = True  # Use permanent session
-            session['user_id'] = user['id']
-            session['user_name'] = user['name']
-            return redirect(url_for('dashboard'))
-        
-        flash('Invalid email or password')
-    return render_template('login.html')
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
-        
-    if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        name = request.form.get('name')
-        timezone = request.form.get('timezone')
-        
-        if not all([email, password, name, timezone]):
-            flash('Please fill in all fields')
-            return redirect(url_for('register'))
-        
-        if query_db('SELECT id FROM users WHERE email = ?', [email], one=True):
-            flash('Email already registered')
-            return redirect(url_for('register'))
-        
-        password_hash = generate_password_hash(password)
-        user_id = modify_db(
-            'INSERT INTO users (email, password_hash, name, timezone) VALUES (?, ?, ?, ?)',
-            [email, password_hash, name, timezone]
-        )
-        
-        session.permanent = True  # Use permanent session
-        session['user_id'] = user_id
-        session['user_name'] = name
-        return redirect(url_for('dashboard'))
-    
-    timezones = [
-        "US/Pacific", "US/Mountain", "US/Central", "US/Eastern",
-        "Europe/London", "Europe/Paris", "Asia/Dubai", "Asia/Singapore",
-        "Australia/Sydney"
-    ]
-    return render_template('register.html', timezones=timezones)
-
 @app.route('/logout')
 def logout():
     session.clear()
@@ -177,6 +130,79 @@ def contact():
             flash('Error sending message. Please try again.', 'error')
             
         return redirect(url_for('index', _anchor='contact'))
+
+@app.route('/slack/login')
+def slack_login():
+    """Initiate Slack OAuth flow"""
+    return redirect(f'https://slack.com/oauth/v2/authorize?'
+                   f'client_id={SLACK_CLIENT_ID}&'
+                   f'scope={SLACK_SCOPES}&'
+                   f'redirect_uri={SLACK_REDIRECT_URI}')
+
+@app.route('/slack/callback')
+def slack_callback():
+    """Handle Slack OAuth callback"""
+    code = request.args.get('code')
+    if not code:
+        flash('Slack authentication failed')
+        return redirect(url_for('index'))
+
+    try:
+        # Exchange code for token
+        client = WebClient()
+        auth_response = client.oauth_v2_access(
+            client_id=SLACK_CLIENT_ID,
+            client_secret=SLACK_CLIENT_SECRET,
+            code=code,
+            redirect_uri=SLACK_REDIRECT_URI
+        )
+
+        # Get user info from Slack
+        user_client = WebClient(token=auth_response['access_token'])
+        user_info = user_client.users_identity()
+        workspace_id = auth_response['team']['id']
+        
+        user = {
+            'email': user_info['user']['email'],
+            'name': user_info['user']['name'],
+            'slack_id': user_info['user']['id'],
+            'avatar': user_info['user'].get('image_512', ''),
+            'workspace_id': workspace_id
+        }
+
+        # Check if user already exists
+        existing_user = query_db('SELECT id FROM users WHERE slack_id = ?', [user['slack_id']], one=True)
+        
+        if existing_user:
+            # Update existing user info
+            modify_db('''
+                UPDATE users 
+                SET name = ?, email = ?, avatar = ?
+                WHERE slack_id = ?
+            ''', [user['name'], user['email'], user['avatar'], user['slack_id']])
+            user_id = existing_user['id']
+        else:
+            # Get user's timezone from Slack
+            user_profile = user_client.users_info(user=user['slack_id'])
+            timezone = user_profile['user'].get('tz', 'UTC')
+            
+            # Create new user
+            user_id = modify_db('''
+                INSERT INTO users (email, name, timezone, slack_id, avatar, workspace_id) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', [user['email'], user['name'], timezone, user['slack_id'], user['avatar'], user['workspace_id']])
+
+        # Set session
+        session.permanent = True
+        session['user_id'] = user_id
+        session['user_name'] = user['name']
+        session['workspace_id'] = workspace_id
+        flash('Successfully connected with Slack!')
+        return redirect(url_for('dashboard'))
+
+    except SlackApiError as e:
+        flash(f'Error authenticating with Slack: {str(e)}')
+        return redirect(url_for('register'))
 
 # Initialize database when the app starts
 with app.app_context():
