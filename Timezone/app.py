@@ -9,15 +9,31 @@ import secrets
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
+from flask import jsonify
+import re
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
 
-# Slack Configuration
+# Deployment configuration
+IS_PRODUCTION = os.getenv('RENDER', False)
+BASE_URL = os.getenv('RENDER_EXTERNAL_URL', 'http://localhost:5000')
+
+# Slack Configuration (read from env; do not hardcode secrets)
 SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID')
 SLACK_CLIENT_SECRET = os.getenv('SLACK_CLIENT_SECRET')
-SLACK_REDIRECT_URI = os.getenv('SLACK_REDIRECT_URI', 'http://localhost:5000/slack/callback')
-SLACK_SCOPES = 'users:read,users:read.email,identity.basic,identity.email,identity.avatar'
+SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback"
+SLACK_SCOPES = os.getenv('SLACK_SCOPES', 'users:read,users:read.email,identity.basic,identity.email,identity.avatar,commands')
+
+# Debug logging of config (but not secrets)
+print(f"Slack App ID: {SLACK_CLIENT_ID}")
+print(f"Redirect URI: {SLACK_REDIRECT_URI}")
+print(f"Scopes: {SLACK_SCOPES}")
+
+# Fail fast in development if Slack credentials are missing
+if not SLACK_CLIENT_ID or not SLACK_CLIENT_SECRET:
+    raise RuntimeError('Missing SLACK_CLIENT_ID or SLACK_CLIENT_SECRET. Set them in your environment or .env file.')
 
 # Create Flask app
 app = Flask(__name__)
@@ -83,6 +99,47 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+# Helper functions for finding meeting times
+def find_suitable_meeting_times(user_timezones):
+    """Find suitable meeting times across different timezones"""
+    # Consider 9 AM to 5 PM as working hours
+    meeting_times = []
+    base_time = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
+    
+    # Check next 5 business days
+    for day in range(5):
+        current_date = base_time + timedelta(days=day)
+        if current_date.weekday() >= 5:  # Skip weekends
+            continue
+            
+        for hour in range(9, 17):  # 9 AM to 5 PM
+            time_to_check = current_date.replace(hour=hour)
+            is_suitable = True
+            
+            # Check if this time works for all users
+            for tz in user_timezones:
+                local_time = time_to_check.astimezone(pytz.timezone(tz))
+                local_hour = local_time.hour
+                if local_hour < 9 or local_hour >= 17:
+                    is_suitable = False
+                    break
+            
+            if is_suitable:
+                meeting_times.append(time_to_check)
+                
+    return meeting_times[:5]  # Return top 5 suitable times
+
+def format_meeting_times(times, user_timezones):
+    """Format meeting times for all users"""
+    formatted_times = []
+    for time in times:
+        time_slots = []
+        for tz in user_timezones:
+            local_time = time.astimezone(pytz.timezone(tz))
+            time_slots.append(f"{local_time.strftime('%I:%M %p %Z')}")
+        formatted_times.append(time_slots)
+    return formatted_times
+
 # Routes
 @app.route('/')
 def index():
@@ -142,13 +199,22 @@ def slack_login():
 @app.route('/slack/callback')
 def slack_callback():
     """Handle Slack OAuth callback"""
+    # Check for OAuth error first
+    error = request.args.get('error')
+    if error:
+        print(f"Slack OAuth error: {error}")  # Debug log
+        flash(f'Slack authorization failed: {error}')
+        return redirect(url_for('index'))
+
+    # Check for auth code
     code = request.args.get('code')
     if not code:
-        flash('Slack authentication failed')
+        print("No code received from Slack")  # Debug log
+        flash('Slack authentication failed - no code received')
         return redirect(url_for('index'))
 
     try:
-        # Exchange code for token
+        print(f"Starting OAuth exchange with code: {code[:5]}...")  # Debug log (truncated)
         client = WebClient()
         auth_response = client.oauth_v2_access(
             client_id=SLACK_CLIENT_ID,
@@ -201,8 +267,82 @@ def slack_callback():
         return redirect(url_for('dashboard'))
 
     except SlackApiError as e:
-        flash(f'Error authenticating with Slack: {str(e)}')
-        return redirect(url_for('register'))
+        error_message = str(e.response['error']) if hasattr(e, 'response') and 'error' in e.response else str(e)
+        print(f"Slack API Error: {error_message}")  # Debug log
+        flash(f'Error connecting to Slack: {error_message}')
+        return redirect(url_for('index'))
+    except Exception as e:
+        print(f"Unexpected error in Slack callback: {str(e)}")  # Debug log
+        flash('An unexpected error occurred during Slack authentication')
+        return redirect(url_for('index'))
+
+@app.route('/slack/command/tz', methods=['POST'])
+def handle_tz_command():
+    """Handle /tz slash command"""
+    if not request.form:
+        return jsonify({'error': 'Invalid request'}), 400
+        
+    # Verify the request is from Slack (you should implement proper verification)
+    text = request.form.get('text', '')
+    user_id = request.form.get('user_id', '')
+    
+    # Parse the command
+    # Expected format: "find time for @user1 and me"
+    if not text.startswith('find time for'):
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': 'Please use the format: /tz find time for @user1 and me'
+        })
+    
+    # Extract mentioned users
+    mentioned_users = re.findall(r'@(\w+)', text)
+    user_timezones = []
+    user_names = []
+    
+    # Get the command issuer's timezone
+    issuer = query_db('SELECT name, timezone FROM users WHERE slack_id = ?', [user_id], one=True)
+    if not issuer:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': 'You need to connect your Slack account first'
+        })
+    
+    user_timezones.append(issuer['timezone'])
+    user_names.append(issuer['name'])
+    
+    # Get mentioned users' timezones
+    for username in mentioned_users:
+        user = query_db('SELECT name, timezone FROM users WHERE name LIKE ?', [f'%{username}%'], one=True)
+        if not user:
+            return jsonify({
+                'response_type': 'ephemeral',
+                'text': f'User @{username} not found in the system'
+            })
+        user_timezones.append(user['timezone'])
+        user_names.append(user['name'])
+    
+    # Find suitable meeting times
+    suitable_times = find_suitable_meeting_times(user_timezones)
+    if not suitable_times:
+        return jsonify({
+            'response_type': 'in_channel',
+            'text': 'No suitable meeting times found in the next 5 business days during working hours (9 AM - 5 PM)'
+        })
+    
+    # Format the response
+    formatted_times = format_meeting_times(suitable_times, user_timezones)
+    response_text = f"Suitable meeting times for {', '.join(user_names)}:\n\n"
+    
+    for i, time_slots in enumerate(formatted_times):
+        response_text += f"Option {i+1}:\n"
+        for j, slot in enumerate(time_slots):
+            response_text += f"- {user_names[j]}: {slot}\n"
+        response_text += "\n"
+    
+    return jsonify({
+        'response_type': 'in_channel',
+        'text': response_text
+    })
 
 # Initialize database when the app starts
 with app.app_context():
