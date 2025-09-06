@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from flask import jsonify
 import re
 from datetime import datetime, timedelta
+import json
+from typing import List, Dict, Any, Optional
 
 # Load environment variables
 load_dotenv()
@@ -20,42 +22,47 @@ load_dotenv()
 IS_PRODUCTION = os.getenv('RENDER', False)
 BASE_URL = os.getenv('RENDER_EXTERNAL_URL', 'http://localhost:5000')
 
-# Slack Configuration (read from env; do not hardcode secrets)
-SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID')
+# Slack Configuration
+SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID') 
 SLACK_CLIENT_SECRET = os.getenv('SLACK_CLIENT_SECRET')
-SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback"
-SLACK_SCOPES = os.getenv('SLACK_SCOPES', 'users:read,users:read.email,identity.basic,identity.email,identity.avatar,commands')
+SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN') 
+SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback" 
+SLACK_SCOPES = os.getenv('SLACK_SCOPES', 'users:read,users:read.email,identity.basic,identity.email,identity.avatar,commands,chat:write')
 
-# Debug logging of config (but not secrets)
+# Debug logging of config
 print(f"Slack App ID: {SLACK_CLIENT_ID}")
 print(f"Redirect URI: {SLACK_REDIRECT_URI}")
 print(f"Scopes: {SLACK_SCOPES}")
 
-# Fail fast in development if Slack credentials are missing
+# Fail fast if Slack credentials are missing
 if not SLACK_CLIENT_ID or not SLACK_CLIENT_SECRET:
     raise RuntimeError('Missing SLACK_CLIENT_ID or SLACK_CLIENT_SECRET. Set them in your environment or .env file.')
 
 # Create Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = secrets.token_hex(16)  # Generate a secure secret key
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=60)  # Session timeout
+app.config['SECRET_KEY'] = secrets.token_hex(16)
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=60)
 
 # Database setup
 def init_db():
     conn = sqlite3.connect('teamzone.db')
     c = conn.cursor()
+    
+    # Users table
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
-            timezone TEXT,
+            timezone TEXT DEFAULT 'UTC',
             slack_id TEXT UNIQUE NOT NULL,
             avatar TEXT,
-            workspace_id TEXT NOT NULL
+            workspace_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
+    # Contact messages table
     c.execute('''
         CREATE TABLE IF NOT EXISTS contact_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +73,37 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Meetings table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS meetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            organizer_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            proposed_times TEXT NOT NULL,
+            selected_time TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organizer_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Meeting participants table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS meeting_participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            meeting_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            availability TEXT,
+            timezone TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (meeting_id) REFERENCES meetings (id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -99,46 +137,124 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# Helper functions for finding meeting times
-def find_suitable_meeting_times(user_timezones):
-    """Find suitable meeting times across different timezones"""
-    # Consider 9 AM to 5 PM as working hours
-    meeting_times = []
-    base_time = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
+# Timezone and meeting utilities
+COMMON_TIMEZONES = {
+    "est": "America/New_York",
+    "pst": "America/Los_Angeles",
+    "cst": "America/Chicago",
+    "mst": "America/Denver",
+    "gmt": "Europe/London",
+    "cet": "Europe/Paris",
+    "aest": "Australia/Sydney",
+    "ist": "Asia/Kolkata",
+    "jst": "Asia/Tokyo",
+}
+
+def parse_timezone_input(timezone_input: str) -> Optional[str]:
+    """Parse timezone input and return valid timezone string"""
+    if not timezone_input:
+        return None
+        
+    timezone_input = timezone_input.lower().strip()
     
-    # Check next 5 business days
-    for day in range(5):
-        current_date = base_time + timedelta(days=day)
-        if current_date.weekday() >= 5:  # Skip weekends
-            continue
-            
+    # Check if it's a common timezone abbreviation
+    if timezone_input in COMMON_TIMEZONES:
+        return COMMON_TIMEZONES[timezone_input]
+    
+    # Try to find the timezone in the pytz database
+    try:
+        # Check if it's a valid timezone
+        pytz.timezone(timezone_input)
+        return timezone_input
+    except pytz.UnknownTimeZoneError:
+        # Try to find a timezone by city name
+        matching_timezones = [
+            tz for tz in pytz.all_timezones 
+            if timezone_input.lower() in tz.lower()
+        ]
+        return matching_timezones[0] if matching_timezones else None
+
+def generate_time_slots(start_date: datetime, days: int = 7, interval_hours: int = 1) -> List[datetime]:
+    """Generate time slots for the next few days"""
+    time_slots = []
+    current_date = start_date.replace(hour=9, minute=0, second=0, microsecond=0)
+    
+    for day in range(days):
         for hour in range(9, 17):  # 9 AM to 5 PM
-            time_to_check = current_date.replace(hour=hour)
-            is_suitable = True
+            time_slot = current_date.replace(hour=hour)
+            time_slots.append(time_slot)
+        current_date += timedelta(days=1)
+    
+    return time_slots
+
+def find_best_meeting_times(user_timezones: List[str], duration_hours: int = 1) -> List[Dict[str, Any]]:
+    """Find the best meeting times across multiple timezones"""
+    if not user_timezones or len(user_timezones) < 2:
+        return []
+    
+    # Get current time in UTC
+    now_utc = datetime.now(pytz.utc)
+    
+    # Generate time suggestions for the next 7 days
+    suggestions = []
+    
+    for day in range(0, 7):
+        current_date = now_utc + timedelta(days=day)
+        
+        # Try times from 9 AM to 5 PM in 2-hour intervals
+        for hour in [9, 11, 14, 16]:
+            # Check if this time works for all timezones
+            local_times = {}
+            feasible = True
             
-            # Check if this time works for all users
-            for tz in user_timezones:
-                local_time = time_to_check.astimezone(pytz.timezone(tz))
-                local_hour = local_time.hour
-                if local_hour < 9 or local_hour >= 17:
-                    is_suitable = False
+            for tz_str in user_timezones:
+                try:
+                    user_timezone = pytz.timezone(tz_str)
+                    local_time = current_date.replace(
+                        hour=hour, minute=0, second=0, microsecond=0
+                    ).astimezone(user_timezone)
+                    
+                    # Check if this is a reasonable time (between 8 AM and 6 PM)
+                    if local_time.hour < 8 or local_time.hour > 18:
+                        feasible = False
+                        break
+                        
+                    local_times[tz_str] = local_time
+                except pytz.UnknownTimeZoneError:
+                    feasible = False
                     break
             
-            if is_suitable:
-                meeting_times.append(time_to_check)
+            if feasible:
+                # Calculate score based on how ideal the time is (closer to 10 AM or 2 PM is better)
+                time_score = 10 - abs(hour - 10) if hour <= 12 else 10 - abs(hour - 14)
                 
-    return meeting_times[:5]  # Return top 5 suitable times
+                suggestions.append({
+                    "utc_time": current_date.replace(hour=hour, minute=0),
+                    "local_times": local_times,
+                    "score": time_score
+                })
+    
+    # Sort by score (highest first) and return top 5
+    suggestions.sort(key=lambda x: x["score"], reverse=True)
+    return suggestions[:5]
 
-def format_meeting_times(times, user_timezones):
-    """Format meeting times for all users"""
-    formatted_times = []
-    for time in times:
-        time_slots = []
-        for tz in user_timezones:
-            local_time = time.astimezone(pytz.timezone(tz))
-            time_slots.append(f"{local_time.strftime('%I:%M %p %Z')}")
-        formatted_times.append(time_slots)
-    return formatted_times
+def format_meeting_suggestions(suggestions: List[Dict[str, Any]], user_map: Dict[str, str]) -> str:
+    """Format meeting suggestions for display"""
+    if not suggestions:
+        return "No suitable meeting times found in the next 7 days."
+    
+    result = "Here are the best meeting times:\n\n"
+    
+    for i, suggestion in enumerate(suggestions, 1):
+        result += f"*Option {i}:* {suggestion['utc_time'].strftime('%A, %B %d at %H:%M UTC')}\n"
+        
+        for tz_str, local_time in suggestion['local_times'].items():
+            user_name = user_map.get(tz_str, tz_str)
+            result += f"• {user_name}: {local_time.strftime('%I:%M %p %Z')}\n"
+        
+        result += "\n"
+    
+    return result
 
 # Routes
 @app.route('/')
@@ -153,17 +269,32 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    users = query_db('SELECT name, timezone FROM users')
-    user_times = []
-    for user in users:
-        if user['timezone']:
-            local_time = datetime.now(pytz.timezone(user['timezone']))
-            user_times.append({
-                'name': user['name'],
-                'time': local_time.strftime('%I:%M %p'),
-                'timezone': user['timezone']
-            })
-    return render_template('dashboard.html', user_times=user_times, user=session.get('user_name'))
+    user_id = session.get('user_id')
+    user = query_db('SELECT * FROM users WHERE id = ?', [user_id], one=True)
+    
+    # Get user's meetings
+    meetings = query_db('''
+        SELECT m.*, u.name as organizer_name 
+        FROM meetings m 
+        JOIN users u ON m.organizer_id = u.id 
+        WHERE m.id IN (
+            SELECT meeting_id FROM meeting_participants WHERE user_id = ?
+        )
+        ORDER BY m.created_at DESC
+    ''', [user_id])
+    
+    # Get team members in the same workspace
+    team_members = query_db('''
+        SELECT id, name, timezone, avatar 
+        FROM users 
+        WHERE workspace_id = ? AND id != ?
+        ORDER BY name
+    ''', [user['workspace_id'], user_id])
+    
+    return render_template('dashboard.html', 
+                         user=user, 
+                         meetings=meetings, 
+                         team_members=team_members)
 
 @app.route('/contact', methods=['POST'])
 def contact():
@@ -199,22 +330,20 @@ def slack_login():
 @app.route('/slack/callback')
 def slack_callback():
     """Handle Slack OAuth callback"""
-    # Check for OAuth error first
     error = request.args.get('error')
     if error:
-        print(f"Slack OAuth error: {error}")  # Debug log
+        print(f"Slack OAuth error: {error}")
         flash(f'Slack authorization failed: {error}')
         return redirect(url_for('index'))
 
-    # Check for auth code
     code = request.args.get('code')
     if not code:
-        print("No code received from Slack")  # Debug log
+        print("No code received from Slack")
         flash('Slack authentication failed - no code received')
         return redirect(url_for('index'))
 
     try:
-        print(f"Starting OAuth exchange with code: {code[:5]}...")  # Debug log (truncated)
+        print(f"Starting OAuth exchange with code: {code[:5]}...")
         client = WebClient()
         auth_response = client.oauth_v2_access(
             client_id=SLACK_CLIENT_ID,
@@ -228,7 +357,7 @@ def slack_callback():
         user_info = user_client.users_identity()
         workspace_id = auth_response['team']['id']
         
-        user = {
+        user_data = {
             'email': user_info['user']['email'],
             'name': user_info['user']['name'],
             'slack_id': user_info['user']['id'],
@@ -237,107 +366,214 @@ def slack_callback():
         }
 
         # Check if user already exists
-        existing_user = query_db('SELECT id FROM users WHERE slack_id = ?', [user['slack_id']], one=True)
+        existing_user = query_db('SELECT id FROM users WHERE slack_id = ?', [user_data['slack_id']], one=True)
         
         if existing_user:
             # Update existing user info
             modify_db('''
                 UPDATE users 
-                SET name = ?, email = ?, avatar = ?
+                SET name = ?, email = ?, avatar = ?, workspace_id = ?
                 WHERE slack_id = ?
-            ''', [user['name'], user['email'], user['avatar'], user['slack_id']])
+            ''', [user_data['name'], user_data['email'], user_data['avatar'], user_data['workspace_id'], user_data['slack_id']])
             user_id = existing_user['id']
         else:
             # Get user's timezone from Slack
-            user_profile = user_client.users_info(user=user['slack_id'])
-            timezone = user_profile['user'].get('tz', 'UTC')
+            try:
+                user_profile = user_client.users_info(user=user_data['slack_id'])
+                timezone = user_profile['user'].get('tz', 'UTC')
+                # Convert Slack timezone format to standard format
+                if timezone and timezone in pytz.all_timezones:
+                    user_data['timezone'] = timezone
+                else:
+                    user_data['timezone'] = 'UTC'
+            except:
+                user_data['timezone'] = 'UTC'
             
             # Create new user
             user_id = modify_db('''
                 INSERT INTO users (email, name, timezone, slack_id, avatar, workspace_id) 
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', [user['email'], user['name'], timezone, user['slack_id'], user['avatar'], user['workspace_id']])
+            ''', [user_data['email'], user_data['name'], user_data['timezone'], 
+                 user_data['slack_id'], user_data['avatar'], user_data['workspace_id']])
 
         # Set session
         session.permanent = True
         session['user_id'] = user_id
-        session['user_name'] = user['name']
+        session['user_name'] = user_data['name']
         session['workspace_id'] = workspace_id
         flash('Successfully connected with Slack!')
         return redirect(url_for('dashboard'))
 
     except SlackApiError as e:
         error_message = str(e.response['error']) if hasattr(e, 'response') and 'error' in e.response else str(e)
-        print(f"Slack API Error: {error_message}")  # Debug log
+        print(f"Slack API Error: {error_message}")
         flash(f'Error connecting to Slack: {error_message}')
         return redirect(url_for('index'))
     except Exception as e:
-        print(f"Unexpected error in Slack callback: {str(e)}")  # Debug log
+        print(f"Unexpected error in Slack callback: {str(e)}")
         flash('An unexpected error occurred during Slack authentication')
         return redirect(url_for('index'))
 
+@app.route('/api/set-timezone', methods=['POST'])
+@login_required
+def set_timezone():
+    """API endpoint to set user timezone"""
+    user_id = session.get('user_id')
+    timezone = request.json.get('timezone')
+    
+    if not timezone:
+        return jsonify({'error': 'Timezone is required'}), 400
+    
+    # Validate timezone
+    valid_timezone = parse_timezone_input(timezone)
+    if not valid_timezone:
+        return jsonify({'error': 'Invalid timezone'}), 400
+    
+    # Update user timezone
+    modify_db('UPDATE users SET timezone = ? WHERE id = ?', [valid_timezone, user_id])
+    
+    return jsonify({'message': 'Timezone updated successfully', 'timezone': valid_timezone})
+
+@app.route('/api/find-meeting-times', methods=['POST'])
+@login_required
+def find_meeting_times():
+    """API endpoint to find meeting times for selected users"""
+    user_id = session.get('user_id')
+    participant_ids = request.json.get('participants', [])
+    duration = request.json.get('duration', 1)
+    
+    if not participant_ids:
+        return jsonify({'error': 'At least one participant is required'}), 400
+    
+    # Get current user's timezone
+    current_user = query_db('SELECT timezone FROM users WHERE id = ?', [user_id], one=True)
+    if not current_user or not current_user['timezone']:
+        return jsonify({'error': 'Please set your timezone first'}), 400
+    
+    # Get all participants' timezones
+    timezones = [current_user['timezone']]
+    user_map = {current_user['timezone']: session.get('user_name', 'You')}
+    
+    placeholders = ','.join(['?'] * len(participant_ids))
+    participants = query_db(f'SELECT id, name, timezone FROM users WHERE id IN ({placeholders})', participant_ids)
+    
+    for participant in participants:
+        if participant['timezone']:
+            timezones.append(participant['timezone'])
+            user_map[participant['timezone']] = participant['name']
+    
+    # Remove duplicates
+    timezones = list(set(timezones))
+    
+    # Find best meeting times
+    suggestions = find_best_meeting_times(timezones, duration)
+    
+    # Format response
+    result = format_meeting_suggestions(suggestions, user_map)
+    
+    return jsonify({'suggestions': result})
+
+@app.route('/api/create-meeting', methods=['POST'])
+@login_required
+def create_meeting():
+    """API endpoint to create a new meeting"""
+    user_id = session.get('user_id')
+    title = request.json.get('title')
+    description = request.json.get('description', '')
+    participant_ids = request.json.get('participants', [])
+    proposed_times = request.json.get('proposed_times', [])
+    
+    if not title or not participant_ids or not proposed_times:
+        return jsonify({'error': 'Title, participants, and proposed times are required'}), 400
+    
+    # Create meeting
+    meeting_id = modify_db('''
+        INSERT INTO meetings (organizer_id, title, description, proposed_times) 
+        VALUES (?, ?, ?, ?)
+    ''', [user_id, title, description, json.dumps(proposed_times)])
+    
+    # Add participants
+    for participant_id in participant_ids:
+        # Get participant timezone
+        participant = query_db('SELECT timezone FROM users WHERE id = ?', [participant_id], one=True)
+        timezone = participant['timezone'] if participant else 'UTC'
+        
+        modify_db('''
+            INSERT INTO meeting_participants (meeting_id, user_id, timezone) 
+            VALUES (?, ?, ?)
+        ''', [meeting_id, participant_id, timezone])
+    
+    # Add organizer as participant
+    current_user = query_db('SELECT timezone FROM users WHERE id = ?', [user_id], one=True)
+    modify_db('''
+        INSERT INTO meeting_participants (meeting_id, user_id, timezone) 
+        VALUES (?, ?, ?)
+    ''', [meeting_id, user_id, current_user['timezone']])
+    
+    return jsonify({'message': 'Meeting created successfully', 'meeting_id': meeting_id})
+
 @app.route('/slack/command/tz', methods=['POST'])
 def handle_tz_command():
-    """Handle /tz slash command"""
+    """Handle /tz slash command from Slack"""
     if not request.form:
         return jsonify({'error': 'Invalid request'}), 400
         
-    # Verify the request is from Slack (you should implement proper verification)
+    # Verify the request is from Slack
     text = request.form.get('text', '')
     user_id = request.form.get('user_id', '')
+    channel_id = request.form.get('channel_id', '')
     
     # Parse the command
-    # Expected format: "find time for @user1 and me"
     if not text.startswith('find time for'):
         return jsonify({
             'response_type': 'ephemeral',
-            'text': 'Please use the format: /tz find time for @user1 and me'
+            'text': 'Please use the format: `/tz find time for @user1 @user2`'
         })
     
     # Extract mentioned users
-    mentioned_users = re.findall(r'@(\w+)', text)
-    user_timezones = []
-    user_names = []
+    mentioned_users = re.findall(r'<@(\w+)>', text)
+    if not mentioned_users:
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': 'Please mention at least one user. Example: `/tz find time for @user1 @user2`'
+        })
     
     # Get the command issuer's timezone
     issuer = query_db('SELECT name, timezone FROM users WHERE slack_id = ?', [user_id], one=True)
-    if not issuer:
+    if not issuer or not issuer['timezone']:
         return jsonify({
             'response_type': 'ephemeral',
-            'text': 'You need to connect your Slack account first'
+            'text': 'You need to set your timezone first. Visit the TeamZone dashboard to set it.'
         })
     
-    user_timezones.append(issuer['timezone'])
-    user_names.append(issuer['name'])
+    user_timezones = [issuer['timezone']]
+    user_map = {issuer['timezone']: issuer['name']}
     
     # Get mentioned users' timezones
-    for username in mentioned_users:
-        user = query_db('SELECT name, timezone FROM users WHERE name LIKE ?', [f'%{username}%'], one=True)
-        if not user:
+    for user_slack_id in mentioned_users:
+        user = query_db('SELECT name, timezone FROM users WHERE slack_id = ?', [user_slack_id], one=True)
+        if not user or not user['timezone']:
             return jsonify({
                 'response_type': 'ephemeral',
-                'text': f'User @{username} not found in the system'
+                'text': f'User <@{user_slack_id}> has not set their timezone yet.'
             })
         user_timezones.append(user['timezone'])
-        user_names.append(user['name'])
+        user_map[user['timezone']] = user['name']
     
-    # Find suitable meeting times
-    suitable_times = find_suitable_meeting_times(user_timezones)
-    if not suitable_times:
-        return jsonify({
-            'response_type': 'in_channel',
-            'text': 'No suitable meeting times found in the next 5 business days during working hours (9 AM - 5 PM)'
-        })
+    # Remove duplicates
+    user_timezones = list(set(user_timezones))
+    
+    # Find best meeting times
+    suggestions = find_best_meeting_times(user_timezones)
     
     # Format the response
-    formatted_times = format_meeting_times(suitable_times, user_timezones)
-    response_text = f"Suitable meeting times for {', '.join(user_names)}:\n\n"
+    if not suggestions:
+        return jsonify({
+            'response_type': 'in_channel',
+            'text': 'No suitable meeting times found in the next 7 days during working hours (9 AM - 5 PM).'
+        })
     
-    for i, time_slots in enumerate(formatted_times):
-        response_text += f"Option {i+1}:\n"
-        for j, slot in enumerate(time_slots):
-            response_text += f"- {user_names[j]}: {slot}\n"
-        response_text += "\n"
+    response_text = format_meeting_suggestions(suggestions, user_map)
     
     return jsonify({
         'response_type': 'in_channel',
