@@ -6,7 +6,6 @@ slack-sdk
 requests
 gunicorn
 datetime
-sqlite3=3.50.4
 functools
 json
 typing
