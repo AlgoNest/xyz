@@ -7,5 +7,3 @@ requests
 gunicorn
 datetime
 functools
-typing
-secrets
