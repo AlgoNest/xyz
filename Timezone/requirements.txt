@@ -5,3 +5,11 @@ python-dotenv
 slack-sdk
 requests
 gunicorn
+datetime
+sqlite3
+functools
+json
+typing
+re
+os
+secrets
