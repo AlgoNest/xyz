@@ -18,21 +18,12 @@ from typing import List, Dict, Any, Optional
 # Load environment variables
 load_dotenv()
 
-# Deployment configuration
-IS_PRODUCTION = os.getenv('RENDER', False)
-BASE_URL = os.getenv('RENDER_EXTERNAL_URL', 'http://localhost:5000')
-
 # Slack Configuration
 SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID') 
 SLACK_CLIENT_SECRET = os.getenv('SLACK_CLIENT_SECRET')
 SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN') 
 SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback" 
-SLACK_SCOPES = os.getenv('SLACK_SCOPES', 'users:read,users:read.email,identity.basic,identity.email,identity.avatar,commands,chat:write')
-
-# Debug logging of config
-print(f"Slack App ID: {SLACK_CLIENT_ID}")
-print(f"Redirect URI: {SLACK_REDIRECT_URI}")
-print(f"Scopes: {SLACK_SCOPES}")
+SLACK_SCOPES = os.getenv('SLACK_SCOPES')
 
 # Fail fast if Slack credentials are missing
 if not SLACK_CLIENT_ID or not SLACK_CLIENT_SECRET:
