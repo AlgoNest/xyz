@@ -17,7 +17,7 @@ from typing import List, Dict, Any, Optional
 
 # Load environment variables
 load_dotenv()
-
+BASE_URL = "https://xyz-production-14b7.up.railway.app"
 # Slack Configuration
 SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID') 
 SLACK_CLIENT_SECRET = os.getenv('SLACK_CLIENT_SECRET')
