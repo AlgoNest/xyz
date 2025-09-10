@@ -8,6 +8,4 @@ gunicorn
 datetime
 functools
 typing
-re
-os
 secrets
