@@ -5,5 +5,3 @@ python-dotenv
 slack-sdk
 requests
 gunicorn
-datetime
-functools
