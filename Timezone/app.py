@@ -15,21 +15,13 @@ from typing import List, Dict, Any, Optional
 
 # Load environment variables
 load_dotenv()
-
-# Deployment configuration
-BASE_URL = 'http://localhost:5000'
-
+BASE_URL = "https://xyz-production-14b7.up.railway.app"
 # Slack Configuration
 SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID') 
 SLACK_CLIENT_SECRET = os.getenv('SLACK_CLIENT_SECRET')
 SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN') 
-# SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback" 
-SLACK_SCOPES = os.getenv('SLACK_SCOPES', 'users:read,users:read.email,identity.basic,identity.email,identity.avatar,commands,chat:write')
-
-# Debug logging of config
-print(f"Slack App ID: {SLACK_CLIENT_ID}")
-# print(f"Redirect URI: {SLACK_REDIRECT_URI}")
-print(f"Scopes: {SLACK_SCOPES}")
+SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback" 
+SLACK_SCOPES = os.getenv('SLACK_SCOPES')
 
 # Fail fast if Slack credentials are missing
 if not SLACK_CLIENT_ID or not SLACK_CLIENT_SECRET:
@@ -582,3 +574,5 @@ with app.app_context():
 
 if __name__ == '__main__':
     app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))  # Railway gives PORT, fallback=5000 for local
+    app.run(host="0.0.0.0", port=port)

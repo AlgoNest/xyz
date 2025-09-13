@@ -1,7 +1,28 @@
+# Env files
 .env
-*.pyc
-__pycache__/
-*.db
-.DS_Store
 .env.local
 .env.*.local
+
+# Python cache / build
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+
+# Databases
+*.db
+
+# Logs
+*.log
+
+# Virtual env
+venv/
+.venv/
+
+# OS / editor junk
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime
+*.pid
