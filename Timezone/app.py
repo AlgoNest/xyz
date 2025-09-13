@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import sqlite3
@@ -9,9 +9,7 @@ import secrets
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
-from flask import jsonify
 import re
-from datetime import datetime, timedelta
 import json
 from typing import List, Dict, Any, Optional
 
@@ -19,19 +17,18 @@ from typing import List, Dict, Any, Optional
 load_dotenv()
 
 # Deployment configuration
-IS_PRODUCTION = os.getenv('RENDER', False)
-BASE_URL = os.getenv('RENDER_EXTERNAL_URL', 'http://localhost:5000')
+BASE_URL = 'http://localhost:5000'
 
 # Slack Configuration
 SLACK_CLIENT_ID = os.getenv('SLACK_CLIENT_ID') 
 SLACK_CLIENT_SECRET = os.getenv('SLACK_CLIENT_SECRET')
 SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN') 
-SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback" 
+# SLACK_REDIRECT_URI = f"{BASE_URL}/slack/callback" 
 SLACK_SCOPES = os.getenv('SLACK_SCOPES', 'users:read,users:read.email,identity.basic,identity.email,identity.avatar,commands,chat:write')
 
 # Debug logging of config
 print(f"Slack App ID: {SLACK_CLIENT_ID}")
-print(f"Redirect URI: {SLACK_REDIRECT_URI}")
+# print(f"Redirect URI: {SLACK_REDIRECT_URI}")
 print(f"Scopes: {SLACK_SCOPES}")
 
 # Fail fast if Slack credentials are missing
@@ -324,8 +321,7 @@ def slack_login():
     """Initiate Slack OAuth flow"""
     return redirect(f'https://slack.com/oauth/v2/authorize?'
                    f'client_id={SLACK_CLIENT_ID}&'
-                   f'scope={SLACK_SCOPES}&'
-                   f'redirect_uri={SLACK_REDIRECT_URI}')
+                   f'scope={SLACK_SCOPES}')
 
 @app.route('/slack/callback')
 def slack_callback():
@@ -349,7 +345,7 @@ def slack_callback():
             client_id=SLACK_CLIENT_ID,
             client_secret=SLACK_CLIENT_SECRET,
             code=code,
-            redirect_uri=SLACK_REDIRECT_URI
+            
         )
 
         # Get user info from Slack
