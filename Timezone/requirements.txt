@@ -5,3 +5,11 @@ python-dotenv
 slack-sdk
 requests
 gunicorn
+flask-security
+flask-session
+flask-wtf
+flask-talisman
+flask-limiter
+flask-cors
+flask-sqlalchemy
+flask-migrate
